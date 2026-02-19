@@ -1,16 +1,10 @@
 //! Tests for response serialization contracts.
 //!
-//! Verifies that response types serialize to JSON matching the OpenAI and
-//! Anthropic API specifications (correct field names, types, and structure).
+//! Verifies that response types serialize to JSON matching the OpenAI
+//! API specification (correct field names, types, and structure).
 
 #![allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 
-use mlx_server::types::anthropic::{
-    AnthropicUsage, ContentBlockDeltaEvent, ContentBlockResponse, ContentBlockStartEvent,
-    ContentBlockStartPayload, ContentBlockStopEvent, CountTokensResponse, CreateMessageResponse,
-    MessageDelta, MessageDeltaEvent, MessageStartEvent, MessageStartPayload, MessageStopEvent,
-    TextDelta,
-};
 use mlx_server::types::openai::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
     ChatCompletionMessage, ChatCompletionResponse, CompletionChoice, CompletionChunk,
@@ -23,13 +17,6 @@ fn make_usage(prompt: u32, completion: u32) -> CompletionUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
-    }
-}
-
-fn make_anthropic_usage(input: u32, output: u32) -> AnthropicUsage {
-    AnthropicUsage {
-        input_tokens: input,
-        output_tokens: output,
     }
 }
 
@@ -72,12 +59,6 @@ fn make_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
             arguments: arguments.to_owned(),
         },
     }
-}
-
-fn assert_event_type(event: &impl serde::Serialize, expected_type: &str) -> serde_json::Value {
-    let json: serde_json::Value = serde_json::to_value(event).unwrap();
-    assert_eq!(json["type"], expected_type);
-    json
 }
 
 // ---------------------------------------------------------------------------
@@ -299,131 +280,6 @@ fn embedding_response_serialization() {
     assert_eq!(json["usage"]["prompt_tokens"], 5);
     let emb = json["data"][0]["embedding"].as_array().unwrap();
     assert_eq!(emb.len(), 3);
-}
-
-// ---------------------------------------------------------------------------
-// Anthropic Messages response
-// ---------------------------------------------------------------------------
-
-#[test]
-fn anthropic_response_has_type_field() {
-    let resp = CreateMessageResponse {
-        id: "msg_abc123".to_owned(),
-        message_type: "message",
-        role: "assistant",
-        content: vec![ContentBlockResponse {
-            block_type: "text",
-            text: "Hello!".to_owned(),
-        }],
-        model: "claude-3".to_owned(),
-        stop_reason: Some("end_turn".to_owned()),
-        usage: make_anthropic_usage(10, 5),
-    };
-    let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
-
-    // Anthropic uses "type" instead of "object"
-    assert_eq!(json["type"], "message");
-    assert_eq!(json["role"], "assistant");
-    assert_eq!(json["content"][0]["type"], "text");
-    assert_eq!(json["content"][0]["text"], "Hello!");
-    assert_eq!(json["stop_reason"], "end_turn");
-    assert_eq!(json["usage"]["input_tokens"], 10);
-    assert_eq!(json["usage"]["output_tokens"], 5);
-}
-
-#[test]
-fn anthropic_count_tokens_response() {
-    let resp = CountTokensResponse { input_tokens: 42 };
-    let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
-    assert_eq!(json["input_tokens"], 42);
-}
-
-// ---------------------------------------------------------------------------
-// Anthropic streaming event types
-// ---------------------------------------------------------------------------
-
-#[test]
-fn anthropic_message_start_event() {
-    let event = MessageStartEvent {
-        event_type: "message_start",
-        message: MessageStartPayload {
-            id: "msg_001".to_owned(),
-            message_type: "message",
-            role: "assistant",
-            content: vec![],
-            model: "claude-3".to_owned(),
-            stop_reason: None,
-            usage: make_anthropic_usage(10, 0),
-        },
-    };
-    let json = assert_event_type(&event, "message_start");
-    assert_eq!(json["message"]["type"], "message");
-    assert_eq!(json["message"]["role"], "assistant");
-    assert!(json["message"]["content"].as_array().unwrap().is_empty());
-    assert!(json["message"]["stop_reason"].is_null());
-}
-
-#[test]
-fn anthropic_content_block_start_event() {
-    let event = ContentBlockStartEvent {
-        event_type: "content_block_start",
-        index: 0,
-        content_block: ContentBlockStartPayload {
-            block_type: "text",
-            text: String::new(),
-        },
-    };
-    let json = assert_event_type(&event, "content_block_start");
-    assert_eq!(json["index"], 0);
-    assert_eq!(json["content_block"]["type"], "text");
-    assert_eq!(json["content_block"]["text"], "");
-}
-
-#[test]
-fn anthropic_content_block_delta_event() {
-    let event = ContentBlockDeltaEvent {
-        event_type: "content_block_delta",
-        index: 0,
-        delta: TextDelta {
-            delta_type: "text_delta",
-            text: "Hello".to_owned(),
-        },
-    };
-    let json = assert_event_type(&event, "content_block_delta");
-    assert_eq!(json["delta"]["type"], "text_delta");
-    assert_eq!(json["delta"]["text"], "Hello");
-}
-
-#[test]
-fn anthropic_content_block_stop_event() {
-    let event = ContentBlockStopEvent {
-        event_type: "content_block_stop",
-        index: 0,
-    };
-    let json = assert_event_type(&event, "content_block_stop");
-    assert_eq!(json["index"], 0);
-}
-
-#[test]
-fn anthropic_message_delta_event() {
-    let event = MessageDeltaEvent {
-        event_type: "message_delta",
-        delta: MessageDelta {
-            stop_reason: Some("end_turn".to_owned()),
-        },
-        usage: make_anthropic_usage(10, 25),
-    };
-    let json = assert_event_type(&event, "message_delta");
-    assert_eq!(json["delta"]["stop_reason"], "end_turn");
-    assert_eq!(json["usage"]["output_tokens"], 25);
-}
-
-#[test]
-fn anthropic_message_stop_event() {
-    let event = MessageStopEvent {
-        event_type: "message_stop",
-    };
-    assert_event_type(&event, "message_stop");
 }
 
 // ---------------------------------------------------------------------------

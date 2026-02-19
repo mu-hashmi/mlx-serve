@@ -17,11 +17,7 @@
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use mlx_server::build_router;
-use mlx_server::{
-    backpressure::BackpressureController,
-    config::ServerConfig,
-    state::AppState,
-};
+use mlx_server::{backpressure::BackpressureController, config::ServerConfig, state::AppState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -133,13 +129,6 @@ async fn chat_completions_empty_messages_returns_400() {
 async fn completions_empty_prompt_returns_400() {
     // Would verify: POST /v1/completions with {"model":"m","prompt":""}
     // returns 400 BadRequest("prompt must not be empty").
-}
-
-#[tokio::test]
-#[ignore = "requires real SimpleEngine to build full router with AppState"]
-async fn anthropic_empty_messages_returns_400() {
-    // Would verify: POST /v1/messages with {"model":"m","messages":[],"max_tokens":100}
-    // returns 400 BadRequest("messages array must not be empty").
 }
 
 #[tokio::test]

@@ -12,8 +12,8 @@ use safetensors::tensor::SafeTensors;
 fn check_1_1_config_parsing() {
     let _guard = common::test_lock();
     let model_dir = common::resolve_model_dir();
-    let config_raw = std::fs::read_to_string(model_dir.join("config.json"))
-        .expect("failed to read config.json");
+    let config_raw =
+        std::fs::read_to_string(model_dir.join("config.json")).expect("failed to read config.json");
     let args: ModelArgs = serde_json::from_str(&config_raw).expect("failed to parse config.json");
 
     assert_eq!(args.hidden_size, 2048, "unexpected hidden_size");
@@ -21,10 +21,7 @@ fn check_1_1_config_parsing() {
         args.num_attention_heads, 32,
         "unexpected num_attention_heads"
     );
-    assert_eq!(
-        args.num_hidden_layers, 16,
-        "unexpected num_hidden_layers"
-    );
+    assert_eq!(args.num_hidden_layers, 16, "unexpected num_hidden_layers");
     assert_eq!(args.vocab_size, 128_256, "unexpected vocab_size");
 }
 
@@ -33,13 +30,13 @@ fn check_1_2_weight_loading() {
     let _guard = common::test_lock();
     let model_dir = common::resolve_model_dir();
 
-    let config_raw = std::fs::read_to_string(model_dir.join("config.json"))
-        .expect("failed to read config.json");
+    let config_raw =
+        std::fs::read_to_string(model_dir.join("config.json")).expect("failed to read config.json");
     let args: ModelArgs = serde_json::from_str(&config_raw).expect("failed to parse config.json");
 
     let index_path = model_dir.join("model.safetensors.index.json");
-    let index_raw = std::fs::read_to_string(&index_path)
-        .expect("failed to read model.safetensors.index.json");
+    let index_raw =
+        std::fs::read_to_string(&index_path).expect("failed to read model.safetensors.index.json");
     let index: WeightMapIndex =
         serde_json::from_str(&index_raw).expect("failed to parse model.safetensors.index.json");
 
@@ -88,8 +85,8 @@ fn check_1_3_full_model_hydration_forward() {
     let _guard = common::test_lock();
     let model_dir = common::resolve_model_dir();
 
-    let config_raw = std::fs::read_to_string(model_dir.join("config.json"))
-        .expect("failed to read config.json");
+    let config_raw =
+        std::fs::read_to_string(model_dir.join("config.json")).expect("failed to read config.json");
     let args: ModelArgs = serde_json::from_str(&config_raw).expect("failed to parse config.json");
 
     let mut model = model_loader::load_model(&model_dir).expect("failed to load model");

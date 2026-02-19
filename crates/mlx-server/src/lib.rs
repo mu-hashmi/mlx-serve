@@ -1,9 +1,7 @@
-//! Axum-based OpenAI/Anthropic-compatible HTTP server for `mlx-serve`.
+//! Axum-based OpenAI-compatible HTTP server for `mlx-serve`.
 
 /// Backpressure and request admission control primitives.
 pub mod backpressure;
-/// Anthropic API request/response mapping helpers.
-pub mod anthropic_adapter;
 /// Server configuration and environment loading.
 pub mod config;
 /// HTTP-facing server error types and conversions.
@@ -51,12 +49,7 @@ pub fn build_router(
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
         .route("/v1/completions", post(routes::completions::completions))
-        .route("/v1/embeddings", post(routes::embeddings::embeddings))
-        .route("/v1/messages", post(routes::anthropic::create_message))
-        .route(
-            "/v1/messages/count_tokens",
-            post(routes::anthropic::count_tokens),
-        );
+        .route("/v1/embeddings", post(routes::embeddings::embeddings));
 
     if let Some(rpm) = NonZeroU32::new(rate_limit) {
         let limiter: SharedRateLimiter = Arc::new(RateLimiter::keyed(Quota::per_minute(rpm)));

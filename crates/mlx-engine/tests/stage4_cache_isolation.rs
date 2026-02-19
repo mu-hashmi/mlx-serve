@@ -31,15 +31,6 @@ fn check_4_1_cache_isolation_between_requests() {
         .generate(&prompt2_tokens, 20, 0.0, 1.0, &[])
         .expect("second request failed");
 
-    let lower = second_after_first.text.to_lowercase();
-    for french_marker in ["bonjour", "salut", "fran", "merci"] {
-        assert!(
-            !lower.contains(french_marker),
-            "second response leaked prior prompt context: '{}'",
-            second_after_first.text
-        );
-    }
-
     let fresh_engine = common::load_engine(4096);
     let prompt2_tokens_fresh = tokens(&fresh_engine, prompt2);
     let second_fresh = fresh_engine
@@ -49,6 +40,14 @@ fn check_4_1_cache_isolation_between_requests() {
     assert_eq!(
         second_after_first.text, second_fresh.text,
         "second request output differs between sequential and fresh process"
+    );
+    assert_eq!(
+        second_after_first.finish_reason, second_fresh.finish_reason,
+        "finish reason differs between sequential and fresh process"
+    );
+    assert_eq!(
+        second_after_first.completion_tokens, second_fresh.completion_tokens,
+        "completion token count differs between sequential and fresh process"
     );
 }
 

@@ -10,10 +10,6 @@
 - `POST /v1/completions`
 - `POST /v1/embeddings`
 
-Anthropic-compatible endpoints:
-- `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
-
 ## `POST /v1/chat/completions`
 
 Request (non-streaming):
@@ -55,4 +51,8 @@ When the bounded request queue is full, generation routes return:
 - HTTP `503 Service Unavailable`
 - `Retry-After` header
 
-This behavior is intentional and prevents unbounded-memory overload.
+`--max-admitted-requests` controls how many requests may be admitted before overload.
+Decode execution is still serialized to one request at a time on Metal.
+
+Cache paging is logical accounting for memory budgets and eviction only; KV tensors
+are still stored in contiguous MLX cache arrays.

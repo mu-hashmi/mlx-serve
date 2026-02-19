@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[command(
     author,
     version,
-    about = "MLX Server - OpenAI and Anthropic-compatible inference server for Apple Silicon"
+    about = "MLX Server - OpenAI-compatible inference server for Apple Silicon"
 )]
 struct CliArgs {
     /// Path to a model directory or HuggingFace model ID. May be repeated to serve multiple models.
@@ -41,9 +41,9 @@ struct CliArgs {
     #[arg(long)]
     timeout: Option<f64>,
 
-    /// Maximum number of requests actively running generation at once.
+    /// Maximum number of requests admitted by backpressure before queueing.
     #[arg(long)]
-    max_concurrent_requests: Option<usize>,
+    max_admitted_requests: Option<usize>,
 
     /// Maximum number of queued requests waiting for a generation slot.
     #[arg(long)]
@@ -70,7 +70,7 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub rate_limit: u32,
     pub timeout: f64,
-    pub max_concurrent_requests: usize,
+    pub max_admitted_requests: usize,
     pub max_queue_size: usize,
     pub retry_after_seconds: u64,
 }
@@ -85,7 +85,7 @@ impl Default for ServerConfig {
             api_key: None,
             rate_limit: 0,
             timeout: 300.0,
-            max_concurrent_requests: num_cpus::get().max(1),
+            max_admitted_requests: num_cpus::get().max(1),
             max_queue_size: 128,
             retry_after_seconds: 1,
         }
@@ -123,10 +123,10 @@ impl ServerConfig {
         if let Some(timeout) = cli.timeout {
             figment = figment.merge(Serialized::default("timeout", timeout));
         }
-        if let Some(max_concurrent_requests) = cli.max_concurrent_requests {
+        if let Some(max_admitted_requests) = cli.max_admitted_requests {
             figment = figment.merge(Serialized::default(
-                "max_concurrent_requests",
-                max_concurrent_requests,
+                "max_admitted_requests",
+                max_admitted_requests,
             ));
         }
         if let Some(max_queue_size) = cli.max_queue_size {
@@ -170,9 +170,9 @@ impl ServerConfig {
                 "timeout must not be negative".to_owned(),
             )));
         }
-        if self.max_concurrent_requests == 0 {
+        if self.max_admitted_requests == 0 {
             return Err(Box::new(figment::Error::from(
-                "max_concurrent_requests must be at least 1".to_owned(),
+                "max_admitted_requests must be at least 1".to_owned(),
             )));
         }
         Ok(())

@@ -24,7 +24,11 @@ const MEBIBYTE: usize = 1024 * 1024;
 
 /// Command-line interface for mlx-serve.
 #[derive(Debug, Parser)]
-#[command(name = "mlx-serve", version, about = "Rust-native MLX inference server")]
+#[command(
+    name = "mlx-serve",
+    version,
+    about = "Rust-native MLX inference server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -60,9 +64,11 @@ struct ServeArgs {
     #[arg(long, default_value_t = 4096)]
     max_cache_mb: usize,
 
-    /// Maximum active generation requests.
+    /// Maximum requests admitted before overload (running + waiting for decode slot).
+    ///
+    /// Actual decode parallelism is fixed to one request at a time.
     #[arg(long, default_value_t = num_cpus::get().max(1))]
-    max_concurrent_requests: usize,
+    max_admitted_requests: usize,
 
     /// Maximum queued requests waiting for an active slot.
     #[arg(long, default_value_t = 128)]
@@ -225,7 +231,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         api_key: args.api_key.clone(),
         rate_limit: args.rate_limit,
         timeout: args.timeout,
-        max_concurrent_requests: args.max_concurrent_requests.max(1),
+        max_admitted_requests: args.max_admitted_requests.max(1),
         max_queue_size: args.max_queue_size,
         retry_after_seconds: args.retry_after_seconds,
     };
@@ -233,7 +239,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     let state: SharedState = Arc::new(AppState {
         engines,
         backpressure: BackpressureController::new(
-            config.max_concurrent_requests,
+            config.max_admitted_requests,
             config.max_queue_size,
             config.retry_after_seconds,
         ),
@@ -254,7 +260,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         address = %local_addr,
         model_id = %model_id,
         max_cache_mb = args.max_cache_mb,
-        max_concurrent_requests = config.max_concurrent_requests,
+        max_admitted_requests = config.max_admitted_requests,
         max_queue_size = config.max_queue_size,
         "mlx-serve is listening"
     );
@@ -318,7 +324,10 @@ fn run_info(args: InfoArgs) -> Result<(), CliError> {
     println!("Architecture: {}", architecture);
     println!("Tensor count: {}", stats.tensor_count);
     println!("Parameter count: {}", format_number(stats.parameter_count));
-    println!("Weights size: {}", format_size(stats.total_tensor_bytes, BINARY));
+    println!(
+        "Weights size: {}",
+        format_size(stats.total_tensor_bytes, BINARY)
+    );
     println!(
         "Estimated runtime memory (weights + 4k KV): {}",
         format_size(runtime_estimate, BINARY)
@@ -358,7 +367,9 @@ fn scan_safetensors(model_dir: &Path) -> Result<TensorStats, CliError> {
                 .iter()
                 .try_fold(1u128, |acc, dim| acc.checked_mul(*dim as u128))
                 .ok_or(CliError::Overflow)?;
-            parameter_count = parameter_count.checked_add(count).ok_or(CliError::Overflow)?;
+            parameter_count = parameter_count
+                .checked_add(count)
+                .ok_or(CliError::Overflow)?;
 
             let bytes = u64::try_from(tensor.data().len()).map_err(|_| CliError::Overflow)?;
             total_tensor_bytes = total_tensor_bytes
@@ -420,8 +431,7 @@ fn estimate_kv_bytes_per_token(config: &serde_json::Value) -> Option<u64> {
         .get("num_key_value_heads")
         .and_then(serde_json::Value::as_u64)?;
 
-    let head_dim = if let Some(value) = config.get("head_dim").and_then(serde_json::Value::as_u64)
-    {
+    let head_dim = if let Some(value) = config.get("head_dim").and_then(serde_json::Value::as_u64) {
         value
     } else {
         let hidden = config.get("hidden_size")?.as_u64()?;
@@ -430,7 +440,10 @@ fn estimate_kv_bytes_per_token(config: &serde_json::Value) -> Option<u64> {
     };
 
     // 2 tensors (K,V) * fp16 bytes.
-    let per_layer = kv_heads.checked_mul(head_dim)?.checked_mul(2)?.checked_mul(2)?;
+    let per_layer = kv_heads
+        .checked_mul(head_dim)?
+        .checked_mul(2)?
+        .checked_mul(2)?;
     layers.checked_mul(per_layer)
 }
 
@@ -474,8 +487,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .ok();
+        let mut signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
         if let Some(ref mut term) = signal {
             let _ = term.recv().await;
         }

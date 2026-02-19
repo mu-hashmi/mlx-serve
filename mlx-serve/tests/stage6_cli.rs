@@ -59,7 +59,10 @@ fn wait_for_process_exit(child: &mut std::process::Child, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("failed to poll child process") {
-            assert!(status.success(), "server exited with non-zero status: {status}");
+            assert!(
+                status.success(),
+                "server exited with non-zero status: {status}"
+            );
             return;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -84,12 +87,19 @@ fn check_stage_6_cli_distribution() {
     assert_success(&build_release, "cargo build --release -p mlx-serve");
 
     let binary = release_binary_path();
-    assert!(binary.exists(), "release binary not found at {}", binary.display());
+    assert!(
+        binary.exists(),
+        "release binary not found at {}",
+        binary.display()
+    );
 
     let help_output = run_output(Command::new(&binary).arg("--help"));
     assert_success(&help_output, "mlx-serve --help");
     let help_text = String::from_utf8_lossy(&help_output.stdout);
-    assert!(help_text.contains("serve"), "--help missing serve subcommand");
+    assert!(
+        help_text.contains("serve"),
+        "--help missing serve subcommand"
+    );
     assert!(
         help_text.contains("generate"),
         "--help missing generate subcommand"
@@ -108,8 +118,13 @@ fn check_stage_6_cli_distribution() {
             .arg("5"),
     );
     assert_success(&generate_output, "mlx-serve generate");
-    let generated = String::from_utf8_lossy(&generate_output.stdout).trim().to_owned();
-    assert!(!generated.is_empty(), "generate command produced empty stdout");
+    let generated = String::from_utf8_lossy(&generate_output.stdout)
+        .trim()
+        .to_owned();
+    assert!(
+        !generated.is_empty(),
+        "generate command produced empty stdout"
+    );
 
     // Check 6.3 — model info
     let info_output = run_output(

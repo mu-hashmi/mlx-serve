@@ -1,6 +1,3 @@
-/// Anthropic-compatible `/v1/messages` handlers.
-#[allow(missing_docs)]
-pub mod anthropic;
 /// OpenAI-compatible `/v1/chat/completions` handlers.
 #[allow(missing_docs)]
 pub mod chat;

@@ -42,7 +42,7 @@ impl RunningServer {
 async fn start_server(
     engine: Arc<SimpleEngine>,
     model_id: String,
-    max_concurrent_requests: usize,
+    max_admitted_requests: usize,
     max_queue_size: usize,
 ) -> RunningServer {
     let mut engines = HashMap::new();
@@ -56,7 +56,7 @@ async fn start_server(
         api_key: None,
         rate_limit: 0,
         timeout: 300.0,
-        max_concurrent_requests,
+        max_admitted_requests,
         max_queue_size,
         retry_after_seconds: 2,
     };
@@ -64,14 +64,19 @@ async fn start_server(
     let state: SharedState = Arc::new(AppState {
         engines,
         backpressure: BackpressureController::new(
-            config.max_concurrent_requests,
+            config.max_admitted_requests,
             config.max_queue_size,
             config.retry_after_seconds,
         ),
         config: config.clone(),
     });
 
-    let app = build_router(state, config.timeout, config.api_key.clone(), config.rate_limit);
+    let app = build_router(
+        state,
+        config.timeout,
+        config.api_key.clone(),
+        config.rate_limit,
+    );
 
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), 0))
         .await
@@ -138,7 +143,9 @@ async fn check_stage_5_http_endpoints_and_backpressure() {
         .and_then(Value::as_array)
         .expect("health response missing models array");
     assert!(
-        models.iter().any(|item| item.as_str() == Some(model_id.as_str())),
+        models
+            .iter()
+            .any(|item| item.as_str() == Some(model_id.as_str())),
         "health response does not contain loaded model id"
     );
 
@@ -180,7 +187,9 @@ async fn check_stage_5_http_endpoints_and_backpressure() {
     assert!(!chat_text.is_empty(), "chat completion content is empty");
 
     let prompt_tokens = chat_json["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-    let completion_tokens = chat_json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let completion_tokens = chat_json["usage"]["completion_tokens"]
+        .as_u64()
+        .unwrap_or(0);
     assert!(prompt_tokens > 0, "expected prompt_tokens > 0");
     assert!(
         completion_tokens > 0 && completion_tokens <= 10,
@@ -190,7 +199,12 @@ async fn check_stage_5_http_endpoints_and_backpressure() {
     // Check 5.4 — Streaming chat completion SSE
     let stream_resp = client
         .post(format!("{}/v1/chat/completions", server.base_url))
-        .json(&chat_payload(&model_id, "Write a short greeting.", 20, true))
+        .json(&chat_payload(
+            &model_id,
+            "Write a short greeting.",
+            20,
+            true,
+        ))
         .send()
         .await
         .expect("streaming chat request failed");
@@ -344,7 +358,11 @@ async fn check_stage_5_http_endpoints_and_backpressure() {
             success_count = success_count.saturating_add(1);
         } else if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             overloaded_count = overloaded_count.saturating_add(1);
-            if response.headers().get(reqwest::header::RETRY_AFTER).is_some() {
+            if response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .is_some()
+            {
                 saw_retry_after = true;
             }
         }
@@ -358,7 +376,10 @@ async fn check_stage_5_http_endpoints_and_backpressure() {
         overloaded_count >= 1,
         "expected at least 1 overloaded request, got {overloaded_count}"
     );
-    assert!(saw_retry_after, "expected Retry-After header on 503 response");
+    assert!(
+        saw_retry_after,
+        "expected Retry-After header on 503 response"
+    );
 
     overload_server.shutdown().await;
 }

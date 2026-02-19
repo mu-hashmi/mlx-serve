@@ -50,13 +50,14 @@ fn should_fetch_file(path: &str) -> bool {
 }
 
 fn resolve_remote_model_dir(repo_id: &str) -> Result<PathBuf, EngineError> {
-    let api = Api::new()
-        .map_err(|error| EngineError::Generation(format!("failed to initialize HF API: {error}")))?;
+    let api = Api::new().map_err(|error| {
+        EngineError::Generation(format!("failed to initialize HF API: {error}"))
+    })?;
     let repo = api.model(repo_id.to_owned());
 
-    let info = repo
-        .info()
-        .map_err(|error| EngineError::Generation(format!("failed to query HF repo '{repo_id}': {error}")))?;
+    let info = repo.info().map_err(|error| {
+        EngineError::Generation(format!("failed to query HF repo '{repo_id}': {error}"))
+    })?;
 
     for sibling in &info.siblings {
         if should_fetch_file(&sibling.rfilename) {
@@ -70,7 +71,9 @@ fn resolve_remote_model_dir(repo_id: &str) -> Result<PathBuf, EngineError> {
     }
 
     let config_path = repo.get("config.json").map_err(|error| {
-        EngineError::Generation(format!("failed to download config.json from '{repo_id}': {error}"))
+        EngineError::Generation(format!(
+            "failed to download config.json from '{repo_id}': {error}"
+        ))
     })?;
 
     let model_dir = config_path.parent().ok_or_else(|| {

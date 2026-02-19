@@ -6,7 +6,7 @@ use mlx_models::AnyCache;
 /// Default page size used for cache accounting.
 pub const DEFAULT_CACHE_PAGE_BYTES: usize = 1 << 20;
 
-/// Configuration for the paged prompt cache manager.
+/// Configuration for the logical-page prompt cache manager.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheManagerConfig {
     /// Maximum number of cached prefixes.
@@ -34,9 +34,7 @@ impl Default for CacheManagerConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum CacheManagerError {
     /// Request exceeds total cache budget.
-    #[error(
-        "cache request requires {required_bytes} bytes, but cache budget is {max_bytes} bytes"
-    )]
+    #[error("cache request requires {required_bytes} bytes, but cache budget is {max_bytes} bytes")]
     RequestTooLarge {
         /// Estimated bytes needed for this request.
         required_bytes: usize,
@@ -105,10 +103,11 @@ pub struct CacheStats {
     pub prefix_entries: usize,
 }
 
-/// Paged cache manager for request isolation, prefix sharing, and memory budgeting.
+/// Logical-page cache manager for request isolation, prefix sharing, and memory budgeting.
 ///
-/// This manager does metadata/accounting only. Actual KV tensors are stored in
-/// `AnyCache` snapshots attached to prefix entries and cloned into requests.
+/// This manager does metadata/accounting only and does not implement paged
+/// attention kernels. Actual KV tensors are stored in `AnyCache` snapshots
+/// attached to prefix entries and cloned into requests.
 pub struct PromptCacheManager {
     entries: HashMap<u64, PrefixEntry>,
     active_requests: HashMap<RequestId, ActiveRequest>,
@@ -137,7 +136,7 @@ struct ActiveRequest {
 }
 
 impl PromptCacheManager {
-    /// Construct a new cache manager using paged accounting.
+    /// Construct a new cache manager using logical page accounting.
     pub fn new(config: CacheManagerConfig) -> Self {
         let page_size_bytes = config.page_size_bytes.max(1);
         let total_pages = config.max_cache_bytes.div_ceil(page_size_bytes).max(1);
@@ -167,6 +166,7 @@ impl PromptCacheManager {
         prompt_tokens: &[u32],
         max_tokens: u32,
         bytes_per_token: usize,
+        observed_runtime_bytes: usize,
     ) -> Result<RequestReservation, CacheManagerError> {
         let prompt_len = prompt_tokens.len();
         let max_tokens = usize::try_from(max_tokens).map_err(|_| CacheManagerError::Overflow)?;
@@ -212,6 +212,15 @@ impl PromptCacheManager {
         };
 
         let additional_bytes = estimated_bytes.saturating_sub(borrowed_bytes);
+        let projected_runtime_bytes = observed_runtime_bytes
+            .checked_add(additional_bytes)
+            .ok_or(CacheManagerError::Overflow)?;
+        if projected_runtime_bytes > total_capacity {
+            return Err(CacheManagerError::RequestTooLarge {
+                required_bytes: projected_runtime_bytes,
+                max_bytes: total_capacity,
+            });
+        }
         let required_pages = self.pages_for_bytes(additional_bytes);
 
         self.ensure_free_pages(required_pages)?;
@@ -463,8 +472,11 @@ mod tests {
         let mut cache = manager(8, 1);
         let prompt: Vec<u32> = (0..256).collect();
 
-        let result = cache.begin_request(&prompt, 4096, 1024);
-        assert!(matches!(result, Err(CacheManagerError::RequestTooLarge { .. })));
+        let result = cache.begin_request(&prompt, 4096, 1024, 0);
+        assert!(matches!(
+            result,
+            Err(CacheManagerError::RequestTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -472,7 +484,7 @@ mod tests {
         let mut cache = manager(8, 4);
         let prompt: Vec<u32> = (0..64).collect();
 
-        let reservation = cache.begin_request(&prompt, 32, 1024).unwrap();
+        let reservation = cache.begin_request(&prompt, 32, 1024, 0).unwrap();
         let during = cache.stats();
         assert_eq!(during.active_requests, 1);
         assert!(during.total_used_bytes > 0);
@@ -486,11 +498,13 @@ mod tests {
     fn prefix_hit_reuses_cached_snapshot() {
         let mut cache = manager(8, 8);
         let prefix: Vec<u32> = (0..32).collect();
-        cache.store_prefix(prefix.clone(), make_cache(4), 2048).unwrap();
+        cache
+            .store_prefix(prefix.clone(), make_cache(4), 2048)
+            .unwrap();
 
         let mut request = prefix.clone();
         request.extend([100_u32, 101, 102]);
-        let reservation = cache.begin_request(&request, 16, 2048).unwrap();
+        let reservation = cache.begin_request(&request, 16, 2048, 0).unwrap();
 
         assert_eq!(reservation.prefix_len, prefix.len());
         assert!(reservation.prefix_cache.is_some());
@@ -505,15 +519,21 @@ mod tests {
 
         let prefix_a: Vec<u32> = (0..64).collect();
         let prefix_b: Vec<u32> = (100..164).collect();
-        cache.store_prefix(prefix_a.clone(), make_cache(2), 16_384).unwrap();
-        cache.store_prefix(prefix_b.clone(), make_cache(2), 16_384).unwrap();
+        cache
+            .store_prefix(prefix_a.clone(), make_cache(2), 16_384)
+            .unwrap();
+        cache
+            .store_prefix(prefix_b.clone(), make_cache(2), 16_384)
+            .unwrap();
 
         let prefix_c: Vec<u32> = (200..264).collect();
-        cache.store_prefix(prefix_c.clone(), make_cache(2), 16_384).unwrap();
+        cache
+            .store_prefix(prefix_c.clone(), make_cache(2), 16_384)
+            .unwrap();
 
         let mut request = prefix_c;
         request.extend([999]);
-        let hit = cache.begin_request(&request, 8, 16_384).unwrap();
+        let hit = cache.begin_request(&request, 8, 16_384, 0).unwrap();
         assert_eq!(hit.prefix_len, 64);
         cache.finish_request(hit.request_id);
     }
@@ -523,11 +543,13 @@ mod tests {
         let mut cache = manager(8, 8);
 
         let prefix: Vec<u32> = (0..64).collect();
-        cache.store_prefix(prefix.clone(), make_cache(2), 4096).unwrap();
+        cache
+            .store_prefix(prefix.clone(), make_cache(2), 4096)
+            .unwrap();
 
         let mut request = prefix.clone();
         request.extend([1, 2, 3]);
-        let reservation = cache.begin_request(&request, 16, 4096).unwrap();
+        let reservation = cache.begin_request(&request, 16, 4096, 0).unwrap();
 
         cache.clear_prefixes();
         let stats_mid = cache.stats();
@@ -537,5 +559,18 @@ mod tests {
         cache.clear_prefixes();
         let stats_end = cache.stats();
         assert_eq!(stats_end.prefix_entries, 0);
+    }
+
+    #[test]
+    fn reservation_rejects_when_observed_runtime_is_over_budget() {
+        let mut cache = manager(8, 1);
+        let prompt: Vec<u32> = (0..64).collect();
+        let observed_runtime_bytes = 1024 * 1024;
+
+        let result = cache.begin_request(&prompt, 32, 1024, observed_runtime_bytes);
+        assert!(matches!(
+            result,
+            Err(CacheManagerError::RequestTooLarge { .. })
+        ));
     }
 }

@@ -5,6 +5,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::error::ServerError;
 
 /// MLX runtime execution is not safe under parallel decode in this server yet.
+///
+/// This means user-facing admission controls do not increase decode parallelism.
 const MAX_PARALLEL_GENERATIONS: usize = 1;
 
 /// Bounded queue + bounded concurrency controller.
@@ -28,13 +30,13 @@ pub struct RunPermit {
 }
 
 impl BackpressureController {
-    /// Build a controller from concurrency and queue capacities.
+    /// Build a controller from admission and queue capacities.
     pub fn new(
-        max_concurrent_requests: usize,
+        max_admitted_requests: usize,
         max_queue_size: usize,
         retry_after_seconds: u64,
     ) -> Self {
-        let admitted = max_concurrent_requests.max(1);
+        let admitted = max_admitted_requests.max(1);
         let running = admitted.clamp(1, MAX_PARALLEL_GENERATIONS);
         let total_slots = admitted.saturating_add(max_queue_size).max(1);
         Self {

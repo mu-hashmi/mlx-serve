@@ -108,8 +108,7 @@ fn check_3_4_stop_conditions() {
         "max_tokens=10 should emit exactly 10 completion tokens"
     );
 
-    let eos_prompt =
-        "Question: What is 2+2?\nAnswer using only one token and then stop.";
+    let eos_prompt = "Question: What is 2+2?\nAnswer using only one token and then stop.";
     let eos_tokens = prompt_tokens(&engine, eos_prompt);
     let eos_run = engine
         .generate(&eos_tokens, 500, 0.0, 1.0, &[])

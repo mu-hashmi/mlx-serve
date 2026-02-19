@@ -102,7 +102,7 @@ impl SamplerRng {
 
 /// Inference engine with request-isolated KV reservations and shared prefix cache pages.
 pub struct SimpleEngine {
-    model_template: Mutex<AnyModel>,
+    model: Mutex<AnyModel>,
     cache_manager: Mutex<PromptCacheManager>,
     tokenizer: Tokenizer,
     template: ChatTemplateRenderer,
@@ -110,12 +110,12 @@ pub struct SimpleEngine {
     eos_token_ids: Vec<u32>,
     max_cache_bytes: usize,
     bytes_per_token: usize,
+    memory_baseline_bytes: usize,
 }
 
-/// Intermediate request state after cache reservation and model clone.
+/// Intermediate request state after cache reservation.
 struct PreparedGeneration {
     request_id: RequestId,
-    model: AnyModel,
     cache: AnyCache,
     prompt_array: Array,
     prompt_len: u32,
@@ -184,6 +184,9 @@ impl SimpleEngine {
         let tokenizer = model_loader::load_tokenizer(&model_dir)?;
         let template = ChatTemplateRenderer::from_model_dir(&model_dir)?;
         let bytes_per_token = estimate_bytes_per_token(&model)?;
+        let memory_baseline_bytes = mlx_core::active_memory_bytes().map_err(|error| {
+            EngineError::Generation(format!("failed to read MLX memory baseline: {error}"))
+        })?;
 
         let eos_token_ids = extract_eos_tokens(&model_dir);
 
@@ -194,6 +197,7 @@ impl SimpleEngine {
             max_cache_bytes = options.max_cache_bytes,
             page_bytes = options.cache_page_bytes,
             prefix_entries = options.prefix_cache_entries,
+            memory_baseline_bytes,
             "Engine ready"
         );
 
@@ -205,7 +209,7 @@ impl SimpleEngine {
         });
 
         Ok(Self {
-            model_template: Mutex::new(model),
+            model: Mutex::new(model),
             cache_manager: Mutex::new(cache_manager),
             tokenizer,
             template,
@@ -213,6 +217,7 @@ impl SimpleEngine {
             eos_token_ids,
             max_cache_bytes: options.max_cache_bytes,
             bytes_per_token,
+            memory_baseline_bytes,
         })
     }
 
@@ -249,10 +254,9 @@ impl SimpleEngine {
     /// Clear prefix cache entries and release MLX cache buffers.
     pub fn clear_runtime_cache(&self) -> Result<(), EngineError> {
         {
-            let mut manager = self
-                .cache_manager
-                .lock()
-                .map_err(|error| EngineError::Generation(format!("Cache lock poisoned: {error}")))?;
+            let mut manager = self.cache_manager.lock().map_err(|error| {
+                EngineError::Generation(format!("Cache lock poisoned: {error}"))
+            })?;
             manager.clear_prefixes();
         }
         mlx_core::clear_mlx_cache()
@@ -285,14 +289,6 @@ impl SimpleEngine {
         EngineError::Generation(error.to_string())
     }
 
-    fn clone_model_template(&self) -> Result<AnyModel, EngineError> {
-        let model = self
-            .model_template
-            .lock()
-            .map_err(|error| EngineError::Generation(format!("Model lock poisoned: {error}")))?;
-        Ok(model.clone())
-    }
-
     fn release_request(&self, request_id: RequestId) {
         match self.cache_manager.lock() {
             Ok(mut manager) => manager.finish_request(request_id),
@@ -313,6 +309,9 @@ impl SimpleEngine {
         max_tokens: u32,
     ) -> Result<PreparedGeneration, EngineError> {
         let prompt_len = Self::prompt_len(prompt_tokens)?;
+        let observed_runtime_bytes = self
+            .active_memory_bytes()?
+            .saturating_sub(self.memory_baseline_bytes);
 
         let reservation = {
             let mut manager = self
@@ -320,11 +319,14 @@ impl SimpleEngine {
                 .lock()
                 .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
             manager
-                .begin_request(prompt_tokens, max_tokens, self.bytes_per_token)
+                .begin_request(
+                    prompt_tokens,
+                    max_tokens,
+                    self.bytes_per_token,
+                    observed_runtime_bytes,
+                )
                 .map_err(Self::map_cache_manager_error)?
         };
-
-        let model = self.clone_model_template()?;
 
         let RequestReservation {
             request_id,
@@ -343,7 +345,14 @@ impl SimpleEngine {
             );
         }
 
-        let cache = prefix_cache.unwrap_or_else(|| model.make_cache());
+        let cache = if let Some(cache) = prefix_cache {
+            cache
+        } else {
+            let model = self.model.lock().map_err(|error| {
+                EngineError::Generation(format!("Model lock poisoned: {error}"))
+            })?;
+            model.make_cache()
+        };
         let prompt_array = Array::from(prefill_tokens.as_slice()).index(NewAxis);
 
         if prompt_array.shape().contains(&0) {
@@ -354,7 +363,6 @@ impl SimpleEngine {
 
         Ok(PreparedGeneration {
             request_id,
-            model,
             cache,
             prompt_array,
             prompt_len,
@@ -365,13 +373,13 @@ impl SimpleEngine {
     /// post-prefill KV state back into the prefix cache.
     fn run_prefill(
         &self,
+        model: &mut AnyModel,
         prompt_tokens: &[u32],
         prepared: &mut PreparedGeneration,
         sampling: SamplingConfig,
         rng: &mut SamplerRng,
     ) -> Result<Array, EngineError> {
-        let logits = prepared
-            .model
+        let logits = model
             .forward(&prepared.prompt_array, None, &mut prepared.cache)
             .map_err(EngineError::Mlx)?;
         let sampled = sample_token_id(&logits.index((.., -1, ..)), sampling, prompt_tokens, rng)?;
@@ -382,9 +390,11 @@ impl SimpleEngine {
             .cache_manager
             .lock()
             .map_err(|e| EngineError::Generation(format!("Cache lock poisoned: {e}")))?;
-        if let Err(error) =
-            manager.store_prefix(prompt_tokens.to_vec(), prepared.cache.clone(), self.bytes_per_token)
-        {
+        if let Err(error) = manager.store_prefix(
+            prompt_tokens.to_vec(),
+            prepared.cache.clone(),
+            self.bytes_per_token,
+        ) {
             tracing::warn!(error = %error, "Prefix cache insert skipped");
         }
 
@@ -491,7 +501,12 @@ impl SimpleEngine {
         let mut prepared = self.prepare_generation(prompt_tokens, max_tokens)?;
         let _lease = RequestLease::new(self, prepared.request_id);
         let prompt_len = prepared.prompt_len;
-        let mut current_token = self.run_prefill(prompt_tokens, &mut prepared, sampling, &mut rng)?;
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|error| EngineError::Generation(format!("Model lock poisoned: {error}")))?;
+        let mut current_token =
+            self.run_prefill(&mut model, prompt_tokens, &mut prepared, sampling, &mut rng)?;
 
         let mut history_tokens: Vec<u32> = prompt_tokens.to_vec();
         let mut tokens: Vec<u32> = Vec::new();
@@ -526,7 +541,7 @@ impl SimpleEngine {
         loop {
             current_token = Self::decode_step(
                 &current_token,
-                &mut prepared.model,
+                &mut model,
                 &mut prepared.cache,
                 sampling,
                 &history_tokens,
@@ -615,7 +630,12 @@ impl SimpleEngine {
         let mut prepared = self.prepare_generation(prompt_tokens, max_tokens)?;
         let _lease = RequestLease::new(self, prepared.request_id);
         let prompt_len = prepared.prompt_len;
-        let mut current_token = self.run_prefill(prompt_tokens, &mut prepared, sampling, &mut rng)?;
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|error| EngineError::Generation(format!("Model lock poisoned: {error}")))?;
+        let mut current_token =
+            self.run_prefill(&mut model, prompt_tokens, &mut prepared, sampling, &mut rng)?;
 
         let mut history_tokens: Vec<u32> = prompt_tokens.to_vec();
         let mut all_tokens: Vec<u32> = Vec::new();
@@ -665,7 +685,7 @@ impl SimpleEngine {
         loop {
             current_token = Self::decode_step(
                 &current_token,
-                &mut prepared.model,
+                &mut model,
                 &mut prepared.cache,
                 sampling,
                 &history_tokens,
@@ -739,9 +759,8 @@ impl SimpleEngine {
 }
 
 fn positive_i32_to_usize(name: &str, value: i32) -> Result<usize, EngineError> {
-    usize::try_from(value).map_err(|_| {
-        EngineError::Generation(format!("invalid {name} in model config: {value}"))
-    })
+    usize::try_from(value)
+        .map_err(|_| EngineError::Generation(format!("invalid {name} in model config: {value}")))
 }
 
 fn sample_token_id(
@@ -793,7 +812,8 @@ fn sample_token_id(
     }
 
     if let Some(top_k) = sampling.top_k
-        && top_k > 0 && top_k < scores.len()
+        && top_k > 0
+        && top_k < scores.len()
     {
         let mut sorted = scores.clone();
         sorted.sort_by(|a, b| b.total_cmp(a));
@@ -805,10 +825,7 @@ fn sample_token_id(
         }
     }
 
-    let max_score = scores
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f64> = scores
         .iter()
         .map(|score| ((*score - max_score) / sampling.temperature).exp() as f64)
@@ -859,12 +876,13 @@ fn sample_token_id(
     }
 
     let last = probs.len().saturating_sub(1);
-    u32::try_from(last).map_err(|_| {
-        EngineError::Generation("token index overflow during sampling".to_owned())
-    })
+    u32::try_from(last)
+        .map_err(|_| EngineError::Generation("token index overflow during sampling".to_owned()))
 }
 
-fn bytes_per_token_from_transformer_args(args: &mlx_models::transformer::ModelArgs) -> Result<usize, EngineError> {
+fn bytes_per_token_from_transformer_args(
+    args: &mlx_models::transformer::ModelArgs,
+) -> Result<usize, EngineError> {
     let layers = positive_i32_to_usize("num_hidden_layers", args.num_hidden_layers)?;
     let kv_heads = positive_i32_to_usize("num_key_value_heads", args.num_key_value_heads)?;
     let hidden = positive_i32_to_usize("hidden_size", args.hidden_size)?;
@@ -904,7 +922,9 @@ fn bytes_per_token_from_qwen3_next_args(args: &Qwen3NextModelArgs) -> Result<usi
 
 fn estimate_bytes_per_token(model: &AnyModel) -> Result<usize, EngineError> {
     match model {
-        AnyModel::Transformer(transformer) => bytes_per_token_from_transformer_args(&transformer.args),
+        AnyModel::Transformer(transformer) => {
+            bytes_per_token_from_transformer_args(&transformer.args)
+        }
         AnyModel::Qwen3Next(qwen3_next) => bytes_per_token_from_qwen3_next_args(&qwen3_next.args),
     }
 }

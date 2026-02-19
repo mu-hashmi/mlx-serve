@@ -95,9 +95,13 @@ impl IntoResponse for ServerError {
         let mut response = (status, body).into_response();
         if let Some(value) = retry_after {
             if let Ok(header_value) = HeaderValue::from_str(&value.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, header_value);
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header_value);
             } else if let Ok(header_value) = HeaderValue::from_str("1") {
-                response.headers_mut().insert(header::RETRY_AFTER, header_value);
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header_value);
             }
         }
         response

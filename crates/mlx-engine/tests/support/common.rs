@@ -11,7 +11,10 @@ pub const TEST_MODEL_REPO: &str = "mlx-community/Llama-3.2-1B-Instruct-4bit";
 static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn test_lock() -> MutexGuard<'static, ()> {
-    TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn resolve_model_dir() -> PathBuf {

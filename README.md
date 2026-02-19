@@ -60,6 +60,12 @@ mlx-sys -> mlx-core -> mlx-nn -> mlx-models -> mlx-engine -> mlx-server -> mlx-s
                          mlx-tokenizers|
 ```
 
+## Runtime Notes
+
+- `--max-admitted-requests` is an admission setting, not decode parallelism; decode runs one request at a time.
+- Prompt cache "pages" are logical accounting units for budget/eviction. KV tensors still use contiguous MLX cache arrays.
+- `mlx-nn` is currently a thin re-export layer, while `mlx-tokenizers` owns tokenizer/chat-template integration logic.
+
 ## Contributing
 
 1. Run the full verification gates before opening a PR:
