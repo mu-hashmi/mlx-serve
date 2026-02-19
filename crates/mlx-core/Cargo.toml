@@ -1,0 +1,16 @@
+[package]
+name = "mlx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Safe Rust wrappers and utilities over MLX arrays, streams, and ops"
+
+[lints]
+workspace = true
+
+[dependencies]
+mlx-sys.workspace = true
+mlx-rs.workspace = true
+thiserror.workspace = true

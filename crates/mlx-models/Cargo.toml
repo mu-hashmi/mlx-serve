@@ -1,0 +1,25 @@
+[package]
+name = "mlx-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Model architectures and weight loading for MLX safetensors models"
+
+[lints]
+workspace = true
+
+[dependencies]
+mlx-core.workspace = true
+mlx-nn.workspace = true
+mlx-tokenizers.workspace = true
+mlx-rs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

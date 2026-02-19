@@ -1,0 +1,60 @@
+[workspace]
+members = ["crates/*", "mlx-serve"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/muhash/mlx-serve"
+readme = "README.md"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+mlx-sys = { path = "crates/mlx-sys", version = "=0.1.0" }
+mlx-core = { path = "crates/mlx-core", version = "=0.1.0" }
+mlx-nn = { path = "crates/mlx-nn", version = "=0.1.0" }
+mlx-models = { path = "crates/mlx-models", version = "=0.1.0" }
+mlx-tokenizers = { path = "crates/mlx-tokenizers", version = "=0.1.0" }
+mlx-engine = { path = "crates/mlx-engine", version = "=0.1.0" }
+mlx-server = { path = "crates/mlx-server", version = "=0.1.0" }
+
+mlx-rs = { version = "0.25.3", features = ["safetensors"] }
+mlx_sys_upstream = { package = "mlx-sys", version = "0.2.0" }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "validate-request", "auth"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.22", features = ["http"] }
+minijinja = { version = "2", features = ["loader"] }
+hf-hub = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+async-stream = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+rand_chacha = "0.9"
+futures = "0.3"
+bytes = "1"
+safetensors = "0.6"
+num_cpus = "1"
+parking_lot = "0.12"
+humansize = "2"
+governor = "0.8"
+figment = { version = "0.10", features = ["env"] }
+directories = "6"

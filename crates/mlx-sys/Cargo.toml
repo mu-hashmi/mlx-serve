@@ -1,0 +1,15 @@
+[package]
+name = "mlx-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Raw FFI surface for MLX, re-exporting upstream mlx-sys bindings"
+
+[lints]
+workspace = true
+
+[dependencies]
+mlx_sys_upstream.workspace = true
+thiserror.workspace = true
