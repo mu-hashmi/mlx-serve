@@ -67,10 +67,13 @@ async fn chat_completions_non_streaming(
 
     let prompt_tokens = engine
         .prepare_chat_prompt(&messages, tools)
-        .map_err(ServerError::Engine)?;
+        .map_err(|error| {
+            ServerError::from_engine_with_retry(error, state.config.retry_after_seconds)
+        })?;
 
+    let engine_for_generate = std::sync::Arc::clone(&engine);
     let output = tokio::task::spawn_blocking(move || {
-        engine.generate(
+        engine_for_generate.generate(
             &prompt_tokens,
             max_tokens,
             temperature,
@@ -80,7 +83,15 @@ async fn chat_completions_non_streaming(
     })
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
+    .map_err(|error| {
+        ServerError::from_engine_with_retry(error, state.config.retry_after_seconds)
+    })?;
+
+    if state.config.clear_runtime_cache_after_request {
+        engine.clear_runtime_cache().map_err(|error| {
+            ServerError::from_engine_with_retry(error, state.config.retry_after_seconds)
+        })?;
+    }
 
     let request_id = generate_request_id();
     let has_tools = req.tools.is_some();
@@ -162,7 +173,9 @@ fn chat_completions_stream(
 
     let prompt_tokens = engine
         .prepare_chat_prompt(&messages, tools)
-        .map_err(ServerError::Engine)?;
+        .map_err(|error| {
+            ServerError::from_engine_with_retry(error, state.config.retry_after_seconds)
+        })?;
 
     let request_id = generate_request_id();
     let created = current_unix_timestamp();

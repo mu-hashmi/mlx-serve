@@ -1,4 +1,14 @@
-use mlx_rs::{Array, error::Exception, ops::concatenate_axis};
+use mlx_rs::{
+    Array,
+    error::Exception,
+    ops::{
+        concatenate_axis,
+        indexing::{TryIndexMutOp, TryIndexOp},
+        zeros_dtype,
+    },
+};
+
+const KV_CACHE_GROWTH_STEP: i32 = 256;
 
 /// Trait for key-value caches used in autoregressive generation.
 pub trait KeyValueCache {
@@ -61,7 +71,7 @@ where
     }
 }
 
-/// Simple KV cache that concatenates new keys/values with existing ones.
+/// KV cache that grows in fixed-size blocks and updates slices in place.
 #[derive(Debug, Clone, Default)]
 pub struct ConcatKeyValueCache {
     keys: Option<Array>,
@@ -90,35 +100,82 @@ impl KeyValueCache for ConcatKeyValueCache {
         keys: Array,
         values: Array,
     ) -> Result<(Array, Array), Exception> {
-        match (self.keys.take(), self.values.take()) {
-            (Some(existing_keys), Some(existing_values)) => {
-                self.keys = Some(concatenate_axis(&[existing_keys, keys], -2)?);
-                self.values = Some(concatenate_axis(&[existing_values, values], -2)?);
-            }
-            _ => {
-                self.keys = Some(keys);
-                self.values = Some(values);
+        let keys_shape = keys.shape();
+        let values_shape = values.shape();
+
+        if keys_shape.len() < 4 || values_shape.len() < 4 {
+            return Err(Exception::custom(
+                "key/value tensors must have at least 4 dimensions",
+            ));
+        }
+
+        let append_len = keys_shape[2];
+        if append_len <= 0 {
+            return Err(Exception::custom(
+                "key/value tensors must have a positive sequence length",
+            ));
+        }
+
+        let prev = self.offset;
+        let required = prev + append_len;
+        let capacity = self.keys.as_ref().map_or(0, |arr| arr.shape()[2]);
+
+        if self.keys.is_none() || required > capacity {
+            let batch = keys_shape[0];
+            let num_heads = keys_shape[1];
+            let key_head_dim = keys_shape[3];
+            let value_head_dim = values_shape[3];
+            let n_steps = (KV_CACHE_GROWTH_STEP + append_len - 1) / KV_CACHE_GROWTH_STEP;
+            let grow_tokens = n_steps * KV_CACHE_GROWTH_STEP;
+            let key_grow_shape = [batch, num_heads, grow_tokens, key_head_dim];
+            let value_grow_shape = [batch, num_heads, grow_tokens, value_head_dim];
+            let new_keys = zeros_dtype(&key_grow_shape, keys.dtype())?;
+            let new_values = zeros_dtype(&value_grow_shape, values.dtype())?;
+
+            match (self.keys.take(), self.values.take()) {
+                (Some(mut existing_keys), Some(mut existing_values)) => {
+                    if prev % KV_CACHE_GROWTH_STEP != 0 {
+                        existing_keys = existing_keys.try_index((.., .., ..prev, ..))?;
+                        existing_values = existing_values.try_index((.., .., ..prev, ..))?;
+                    }
+
+                    self.keys = Some(concatenate_axis(&[existing_keys, new_keys], -2)?);
+                    self.values = Some(concatenate_axis(&[existing_values, new_values], -2)?);
+                }
+                _ => {
+                    self.keys = Some(new_keys);
+                    self.values = Some(new_values);
+                }
             }
         }
 
-        let key_shape = self
-            .keys
-            .as_ref()
-            .ok_or_else(|| Exception::custom("Keys cannot be None after update"))?
-            .shape();
-        let seq_dim_index = key_shape.len().wrapping_sub(2);
-        self.offset = *key_shape
-            .get(seq_dim_index)
-            .ok_or_else(|| Exception::custom("Key shape has fewer than 2 dimensions"))?;
+        self.offset = required;
+
+        {
+            let stored_keys = self
+                .keys
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Keys cannot be None after update"))?;
+            stored_keys.try_index_mut((.., .., prev..self.offset, ..), &keys)?;
+        }
+        {
+            let stored_values = self
+                .values
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Values cannot be None after update"))?;
+            stored_values.try_index_mut((.., .., prev..self.offset, ..), &values)?;
+        }
 
         let result_keys = self
             .keys
-            .clone()
-            .ok_or_else(|| Exception::custom("Keys cannot be None after update"))?;
+            .as_ref()
+            .ok_or_else(|| Exception::custom("Keys cannot be None after update"))?
+            .try_index((.., .., ..self.offset, ..))?;
         let result_values = self
             .values
-            .clone()
-            .ok_or_else(|| Exception::custom("Values cannot be None after update"))?;
+            .as_ref()
+            .ok_or_else(|| Exception::custom("Values cannot be None after update"))?
+            .try_index((.., .., ..self.offset, ..))?;
 
         Ok((result_keys, result_values))
     }
@@ -186,6 +243,62 @@ mod tests {
         }
 
         assert_eq!(cache.offset(), 8);
+    }
+
+    #[test]
+    fn test_concat_cache_preallocates_and_reuses_capacity() {
+        let mut cache = ConcatKeyValueCache::new();
+
+        let (keys, values) = make_kv_pair(3, 8);
+        let (result_keys, result_values) = cache.update_and_fetch(keys, values).unwrap();
+        assert_eq!(result_keys.shape(), &[1, 2, 3, 8]);
+        assert_eq!(result_values.shape(), &[1, 2, 3, 8]);
+        assert_eq!(cache.offset(), 3);
+        assert_eq!(
+            cache.keys.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP
+        );
+        assert_eq!(
+            cache.values.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP
+        );
+
+        let (keys2, values2) = make_kv_pair(1, 8);
+        cache.update_and_fetch(keys2, values2).unwrap();
+        assert_eq!(cache.offset(), 4);
+        assert_eq!(
+            cache.keys.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP
+        );
+        assert_eq!(
+            cache.values.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP
+        );
+    }
+
+    #[test]
+    fn test_concat_cache_grows_to_next_block() {
+        let mut cache = ConcatKeyValueCache::new();
+
+        let (keys, values) = make_kv_pair(KV_CACHE_GROWTH_STEP, 8);
+        cache.update_and_fetch(keys, values).unwrap();
+        assert_eq!(cache.offset(), KV_CACHE_GROWTH_STEP);
+        assert_eq!(
+            cache.keys.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP
+        );
+
+        let (keys2, values2) = make_kv_pair(1, 8);
+        cache.update_and_fetch(keys2, values2).unwrap();
+        assert_eq!(cache.offset(), KV_CACHE_GROWTH_STEP + 1);
+        assert_eq!(
+            cache.keys.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP * 2
+        );
+        assert_eq!(
+            cache.values.as_ref().unwrap().shape()[2],
+            KV_CACHE_GROWTH_STEP * 2
+        );
     }
 
     #[test]

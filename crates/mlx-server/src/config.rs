@@ -52,6 +52,10 @@ struct CliArgs {
     /// Retry-After value in seconds used for backpressure 503 responses.
     #[arg(long)]
     retry_after_seconds: Option<u64>,
+
+    /// Clear MLX runtime cache after each non-streaming generation request.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    clear_runtime_cache_after_request: bool,
 }
 
 /// Resolved server configuration.
@@ -73,6 +77,7 @@ pub struct ServerConfig {
     pub max_admitted_requests: usize,
     pub max_queue_size: usize,
     pub retry_after_seconds: u64,
+    pub clear_runtime_cache_after_request: bool,
 }
 
 impl Default for ServerConfig {
@@ -88,6 +93,7 @@ impl Default for ServerConfig {
             max_admitted_requests: num_cpus::get().max(1),
             max_queue_size: 128,
             retry_after_seconds: 1,
+            clear_runtime_cache_after_request: false,
         }
     }
 }
@@ -136,6 +142,12 @@ impl ServerConfig {
             figment = figment.merge(Serialized::default(
                 "retry_after_seconds",
                 retry_after_seconds,
+            ));
+        }
+        if cli.clear_runtime_cache_after_request {
+            figment = figment.merge(Serialized::default(
+                "clear_runtime_cache_after_request",
+                true,
             ));
         }
 

@@ -1,4 +1,8 @@
-use minijinja::{Environment, Value};
+use std::path::Path;
+
+use minijinja::{
+    Environment, Error as MiniJinjaError, ErrorKind as MiniJinjaErrorKind, Value, value::Kwargs,
+};
 use serde::Serialize;
 
 use crate::error::EngineError;
@@ -18,26 +22,49 @@ pub struct ChatMessage {
 /// Renders chat messages using a Jinja2 template (HuggingFace format).
 pub struct ChatTemplateRenderer {
     env: Environment<'static>,
+    special_tokens: SpecialTokens,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpecialTokens {
+    bos_token: Option<String>,
+    eos_token: Option<String>,
+    pad_token: Option<String>,
+    unk_token: Option<String>,
+    sep_token: Option<String>,
 }
 
 impl ChatTemplateRenderer {
     /// Create a renderer from a Jinja2 template string.
     pub fn new(template_source: impl Into<String>) -> Result<Self, EngineError> {
+        Self::new_with_tokens(template_source, SpecialTokens::default())
+    }
+
+    fn new_with_tokens(
+        template_source: impl Into<String>,
+        special_tokens: SpecialTokens,
+    ) -> Result<Self, EngineError> {
         let mut env = Environment::new();
         env.add_filter("tojson", tojson_filter);
+        env.add_function("raise_exception", raise_exception);
         env.add_template_owned("chat".to_owned(), template_source.into())
             .map_err(|e| EngineError::Template(e.to_string()))?;
-        Ok(Self { env })
+        Ok(Self {
+            env,
+            special_tokens,
+        })
     }
 
     /// Load template from a model directory (chat_template.jinja or tokenizer_config.json).
-    pub fn from_model_dir(model_dir: &std::path::Path) -> Result<Self, EngineError> {
+    pub fn from_model_dir(model_dir: &Path) -> Result<Self, EngineError> {
+        let special_tokens = load_special_tokens(model_dir)?;
+
         // Prefer standalone chat_template.jinja
         let jinja_path = model_dir.join("chat_template.jinja");
         if jinja_path.exists() {
             let template = std::fs::read_to_string(&jinja_path)
                 .map_err(|e| EngineError::Template(format!("Failed to read template: {e}")))?;
-            return Self::new(&template);
+            return Self::new_with_tokens(&template, special_tokens);
         }
 
         // Fall back to tokenizer_config.json
@@ -48,7 +75,7 @@ impl ChatTemplateRenderer {
             let config: serde_json::Value = serde_json::from_str(&config_str)
                 .map_err(|e| EngineError::Template(format!("Invalid JSON: {e}")))?;
             if let Some(template) = config.get("chat_template").and_then(|v| v.as_str()) {
-                return Self::new(template);
+                return Self::new_with_tokens(template, special_tokens);
             }
         }
 
@@ -69,18 +96,23 @@ impl ChatTemplateRenderer {
             .get_template("chat")
             .map_err(|e| EngineError::Template(e.to_string()))?;
 
-        let mut context = minijinja::context! {
-            messages => messages,
-            add_generation_prompt => add_generation_prompt,
-        };
-
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "messages".to_owned(),
+            serde_json::to_value(messages)
+                .map_err(|e| EngineError::Template(format!("Failed to serialize messages: {e}")))?,
+        );
+        context.insert(
+            "add_generation_prompt".to_owned(),
+            serde_json::Value::Bool(add_generation_prompt),
+        );
         if let Some(tool_list) = tools {
-            context = minijinja::context! {
-                messages => messages,
-                tools => tool_list,
-                add_generation_prompt => add_generation_prompt,
-            };
+            context.insert(
+                "tools".to_owned(),
+                serde_json::Value::Array(tool_list.to_vec()),
+            );
         }
+        self.special_tokens.insert_into_context(&mut context);
 
         tmpl.render(context)
             .map_err(|e| EngineError::Template(e.to_string()))
@@ -88,15 +120,136 @@ impl ChatTemplateRenderer {
 }
 
 /// Custom tojson filter for minijinja (used by HF chat templates).
-fn tojson_filter(value: Value) -> Result<String, minijinja::Error> {
-    let serialized = serde_json::to_string(&value).map_err(|e| {
-        minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
-            "JSON serialization failed",
-        )
-        .with_source(e)
-    })?;
+fn tojson_filter(value: Value, kwargs: Kwargs) -> Result<String, MiniJinjaError> {
+    let indent: Option<usize> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+
+    let serialized = if let Some(width) = indent {
+        let mut output = Vec::new();
+        let indentation = vec![b' '; width];
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(&indentation);
+        let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
+        value.serialize(&mut serializer).map_err(|e| {
+            MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "JSON serialization failed",
+            )
+            .with_source(e)
+        })?;
+        String::from_utf8(output).map_err(|e| {
+            MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, "JSON encoding failed")
+                .with_source(e)
+        })?
+    } else {
+        serde_json::to_string(&value).map_err(|e| {
+            MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "JSON serialization failed",
+            )
+            .with_source(e)
+        })?
+    };
+
     Ok(serialized)
+}
+
+fn raise_exception(message: String) -> Result<String, MiniJinjaError> {
+    Err(MiniJinjaError::new(
+        MiniJinjaErrorKind::InvalidOperation,
+        message,
+    ))
+}
+
+impl SpecialTokens {
+    fn from_json(value: &serde_json::Value) -> Self {
+        Self {
+            bos_token: token_value(value, "bos_token"),
+            eos_token: token_value(value, "eos_token"),
+            pad_token: token_value(value, "pad_token"),
+            unk_token: token_value(value, "unk_token"),
+            sep_token: token_value(value, "sep_token"),
+        }
+    }
+
+    fn merge_missing(&mut self, other: Self) {
+        if self.bos_token.is_none() {
+            self.bos_token = other.bos_token;
+        }
+        if self.eos_token.is_none() {
+            self.eos_token = other.eos_token;
+        }
+        if self.pad_token.is_none() {
+            self.pad_token = other.pad_token;
+        }
+        if self.unk_token.is_none() {
+            self.unk_token = other.unk_token;
+        }
+        if self.sep_token.is_none() {
+            self.sep_token = other.sep_token;
+        }
+    }
+
+    fn insert_into_context(&self, context: &mut serde_json::Map<String, serde_json::Value>) {
+        if let Some(token) = &self.bos_token {
+            context.insert(
+                "bos_token".to_owned(),
+                serde_json::Value::String(token.clone()),
+            );
+        }
+        if let Some(token) = &self.eos_token {
+            context.insert(
+                "eos_token".to_owned(),
+                serde_json::Value::String(token.clone()),
+            );
+        }
+        if let Some(token) = &self.pad_token {
+            context.insert(
+                "pad_token".to_owned(),
+                serde_json::Value::String(token.clone()),
+            );
+        }
+        if let Some(token) = &self.unk_token {
+            context.insert(
+                "unk_token".to_owned(),
+                serde_json::Value::String(token.clone()),
+            );
+        }
+        if let Some(token) = &self.sep_token {
+            context.insert(
+                "sep_token".to_owned(),
+                serde_json::Value::String(token.clone()),
+            );
+        }
+    }
+}
+
+fn token_value(container: &serde_json::Value, key: &str) -> Option<String> {
+    match container.get(key) {
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        Some(serde_json::Value::Object(map)) => map
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn load_special_tokens(model_dir: &Path) -> Result<SpecialTokens, EngineError> {
+    let mut tokens = SpecialTokens::default();
+    for file_name in ["tokenizer_config.json", "special_tokens_map.json"] {
+        let path = model_dir.join(file_name);
+        if !path.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            EngineError::Template(format!("Failed to read {}: {e}", path.display()))
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            EngineError::Template(format!("Invalid JSON in {}: {e}", path.display()))
+        })?;
+        tokens.merge_missing(SpecialTokens::from_json(&json));
+    }
+    Ok(tokens)
 }
 
 #[cfg(test)]
@@ -260,6 +413,24 @@ TOOLS:{{ tools | length }}
             .apply(&[msg("user", "from_config")], None, false)
             .unwrap();
         assert_eq!(result, "from_config");
+    }
+
+    #[test]
+    fn test_from_model_dir_injects_bos_token_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "chat_template": "{{- bos_token }}{%- for message in messages %}{{ message.content }}{%- endfor %}",
+                "bos_token": "<s>"
+            }"#,
+        )
+        .unwrap();
+        let renderer = ChatTemplateRenderer::from_model_dir(dir.path()).unwrap();
+        let result = renderer
+            .apply(&[msg("user", "hello")], None, false)
+            .unwrap();
+        assert_eq!(result, "<s>hello");
     }
 
     #[test]

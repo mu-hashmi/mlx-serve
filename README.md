@@ -64,7 +64,9 @@ mlx-sys -> mlx-core -> mlx-nn -> mlx-models -> mlx-engine -> mlx-server -> mlx-s
 
 - `--max-admitted-requests` is an admission setting, not decode parallelism; decode runs one request at a time.
 - Prompt cache "pages" are logical accounting units for budget/eviction. KV tensors still use contiguous MLX cache arrays.
+- `--clear-runtime-cache-after-request` clears MLX/runtime cache after each non-streaming request. This reduces steady-state footprint at the cost of throughput and cache reuse.
 - `mlx-nn` is currently a thin re-export layer, while `mlx-tokenizers` owns tokenizer/chat-template integration logic.
+- Known limitation: some Qwen3 chat templates rely on MiniJinja methods like `startswith` that are not available in the current renderer path, which can fail request rendering for affected templates.
 
 ## Contributing
 

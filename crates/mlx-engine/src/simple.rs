@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use mlx_models::{AnyCache, AnyModel, qwen3_next::Qwen3NextModelArgs};
 use mlx_rs::{
     Array,
-    ops::indexing::{IndexOp, NewAxis},
+    ops::indexing::{IndexOp, NewAxis, argmax_axis},
+    random::{ShapeOrCount, categorical, key},
     transforms::eval,
 };
 use rand::Rng;
@@ -18,8 +19,8 @@ use crate::{
     error::EngineError,
     model_loader,
     prompt_cache::{
-        CacheManagerConfig, CacheManagerError, DEFAULT_CACHE_PAGE_BYTES, PromptCacheManager,
-        RequestId, RequestReservation,
+        CacheManagerConfig, CacheManagerError, CacheStats, DEFAULT_CACHE_PAGE_BYTES,
+        PromptCacheManager, RequestId, RequestReservation,
     },
 };
 
@@ -96,6 +97,13 @@ impl SamplerRng {
         match self {
             SamplerRng::Seeded(rng) => rng.random::<f64>(),
             SamplerRng::Thread(rng) => rng.random::<f64>(),
+        }
+    }
+
+    fn random_u64(&mut self) -> u64 {
+        match self {
+            SamplerRng::Seeded(rng) => rng.random::<u64>(),
+            SamplerRng::Thread(rng) => rng.random::<u64>(),
         }
     }
 }
@@ -226,6 +234,11 @@ impl SimpleEngine {
         self.max_cache_bytes
     }
 
+    /// Return MLX memory baseline captured during engine initialization.
+    pub fn memory_baseline_bytes(&self) -> usize {
+        self.memory_baseline_bytes
+    }
+
     /// Get the model name.
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -249,6 +262,15 @@ impl SimpleEngine {
             .lock()
             .map_err(|error| EngineError::Generation(format!("Cache lock poisoned: {error}")))?;
         Ok(manager.stats().prefix_bytes)
+    }
+
+    /// Read full prefix-cache accounting counters.
+    pub fn prefix_cache_stats(&self) -> Result<CacheStats, EngineError> {
+        let manager = self
+            .cache_manager
+            .lock()
+            .map_err(|error| EngineError::Generation(format!("Cache lock poisoned: {error}")))?;
+        Ok(manager.stats())
     }
 
     /// Clear prefix cache entries and release MLX cache buffers.
@@ -424,14 +446,16 @@ impl SimpleEngine {
         token_id: u32,
         completion_len: u32,
         max_tokens: u32,
-        decoded_text: &str,
+        generated_text: &str,
+        stop_window: &str,
         stop_sequences: &[String],
     ) -> FinishCondition {
         if self.eos_token_ids.contains(&token_id) {
             return FinishCondition::Eos;
         }
         if !stop_sequences.is_empty()
-            && let Some(truncated) = check_stop_sequences(decoded_text, stop_sequences)
+            && let Some(truncated) =
+                truncate_text_for_stop_window(generated_text, stop_window, stop_sequences)
         {
             return FinishCondition::StopSequence(truncated);
         }
@@ -446,6 +470,10 @@ impl SimpleEngine {
         self.tokenizer
             .decode(tokens, true)
             .map_err(|e| EngineError::Tokenization(e.to_string()))
+    }
+
+    fn decode_token(&self, token_id: u32) -> Result<String, EngineError> {
+        self.decode_tokens(std::slice::from_ref(&token_id))
     }
 
     /// Convert a token count to u32, with an overflow error.
@@ -510,28 +538,52 @@ impl SimpleEngine {
 
         let mut history_tokens: Vec<u32> = prompt_tokens.to_vec();
         let mut tokens: Vec<u32> = Vec::new();
+        let track_stop_sequences = !stop_sequences.is_empty();
+        let stop_window_chars = if track_stop_sequences {
+            max_stop_sequence_chars(stop_sequences)
+        } else {
+            0
+        };
+        let mut generated_text = String::new();
+        let mut stop_window = String::new();
+
         let first_token_id: u32 = current_token.item();
         tokens.push(first_token_id);
         history_tokens.push(first_token_id);
 
-        let first_decoded = self.decode_tokens(&tokens)?;
+        if track_stop_sequences {
+            let first_token_text = self.decode_token(first_token_id)?;
+            generated_text.push_str(&first_token_text);
+            append_stop_window(&mut stop_window, &first_token_text, stop_window_chars);
+        }
 
-        let condition = self.check_termination(
-            first_token_id,
-            1,
-            max_tokens,
-            &first_decoded,
-            stop_sequences,
-        );
+        let condition = if track_stop_sequences {
+            self.check_termination(
+                first_token_id,
+                1,
+                max_tokens,
+                &generated_text,
+                &stop_window,
+                stop_sequences,
+            )
+        } else if self.eos_token_ids.contains(&first_token_id) {
+            FinishCondition::Eos
+        } else if 1 >= max_tokens {
+            FinishCondition::MaxTokens
+        } else {
+            FinishCondition::None
+        };
 
         if condition.is_finished() {
-            let text = match &condition {
-                FinishCondition::StopSequence(truncated) => truncated.clone(),
-                _ => first_decoded,
+            let finish_reason = condition.reason_str().unwrap_or("stop").to_owned();
+            let text = match condition {
+                FinishCondition::StopSequence(truncated) => truncated,
+                _ if track_stop_sequences => generated_text,
+                _ => self.decode_tokens(&tokens)?,
             };
             return Ok(GenerationOutput {
                 text,
-                finish_reason: condition.reason_str().unwrap_or("stop").to_owned(),
+                finish_reason,
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
             });
@@ -556,20 +608,41 @@ impl SimpleEngine {
                 eval([&current_token]).map_err(EngineError::Mlx)?;
             }
 
-            let completion_len = Self::completion_len(&tokens)?;
-            let text = self.decode_tokens(&tokens)?;
+            if track_stop_sequences {
+                let token_text = self.decode_token(token_id)?;
+                generated_text.push_str(&token_text);
+                append_stop_window(&mut stop_window, &token_text, stop_window_chars);
+            }
 
-            let loop_condition =
-                self.check_termination(token_id, completion_len, max_tokens, &text, stop_sequences);
+            let completion_len = Self::completion_len(&tokens)?;
+
+            let loop_condition = if track_stop_sequences {
+                self.check_termination(
+                    token_id,
+                    completion_len,
+                    max_tokens,
+                    &generated_text,
+                    &stop_window,
+                    stop_sequences,
+                )
+            } else if self.eos_token_ids.contains(&token_id) {
+                FinishCondition::Eos
+            } else if completion_len >= max_tokens {
+                FinishCondition::MaxTokens
+            } else {
+                FinishCondition::None
+            };
 
             if loop_condition.is_finished() {
-                let final_text = match &loop_condition {
-                    FinishCondition::StopSequence(truncated) => truncated.clone(),
-                    _ => text,
+                let finish_reason = loop_condition.reason_str().unwrap_or("stop").to_owned();
+                let final_text = match loop_condition {
+                    FinishCondition::StopSequence(truncated) => truncated,
+                    _ if track_stop_sequences => generated_text,
+                    _ => self.decode_tokens(&tokens)?,
                 };
                 return Ok(GenerationOutput {
                     text: final_text,
-                    finish_reason: loop_condition.reason_str().unwrap_or("stop").to_owned(),
+                    finish_reason,
                     prompt_tokens: prompt_len,
                     completion_tokens: completion_len,
                 });
@@ -639,36 +712,39 @@ impl SimpleEngine {
 
         let mut history_tokens: Vec<u32> = prompt_tokens.to_vec();
         let mut all_tokens: Vec<u32> = Vec::new();
+        let stop_window_chars = max_stop_sequence_chars(stop_sequences);
+        let mut generated_text = String::new();
+        let mut stop_window = String::new();
+
         let first_token_id: u32 = current_token.item();
         all_tokens.push(first_token_id);
         history_tokens.push(first_token_id);
 
-        let first_decoded = self.decode_tokens(&all_tokens)?;
-        let (first_text, first_hit_stop) = if !stop_sequences.is_empty() {
-            if let Some(truncated) = check_stop_sequences(&first_decoded, stop_sequences) {
-                (truncated, true)
-            } else {
-                (first_decoded.clone(), false)
-            }
-        } else {
-            (first_decoded.clone(), false)
-        };
-        let mut prev_decoded_len = first_decoded.len();
+        let first_token_text = self.decode_token(first_token_id)?;
+        generated_text.push_str(&first_token_text);
+        append_stop_window(&mut stop_window, &first_token_text, stop_window_chars);
 
-        let first_is_eos = self.eos_token_ids.contains(&first_token_id);
-        let finished = first_is_eos || first_hit_stop || 1 >= max_tokens;
+        let first_condition = self.check_termination(
+            first_token_id,
+            1,
+            max_tokens,
+            &generated_text,
+            &stop_window,
+            stop_sequences,
+        );
+        let first_text = match &first_condition {
+            FinishCondition::StopSequence(truncated) => truncated.clone(),
+            _ => generated_text.clone(),
+        };
+        let mut emitted_len = first_text.len();
+        let finished = first_condition.is_finished();
+        let first_finish_reason = first_condition.reason_str().map(str::to_owned);
 
         if sender
             .blocking_send(StreamingOutput {
                 new_text: first_text,
                 finished,
-                finish_reason: if first_is_eos || first_hit_stop {
-                    Some("stop".to_owned())
-                } else if 1 >= max_tokens {
-                    Some("length".to_owned())
-                } else {
-                    None
-                },
+                finish_reason: first_finish_reason,
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
             })
@@ -701,40 +777,35 @@ impl SimpleEngine {
             }
 
             let completion_len = Self::completion_len(&all_tokens)?;
+            let token_text = self.decode_token(token_id)?;
+            generated_text.push_str(&token_text);
+            append_stop_window(&mut stop_window, &token_text, stop_window_chars);
 
-            let full_text = self.decode_tokens(&all_tokens)?;
-            let new_text = full_text
-                .get(prev_decoded_len..)
-                .unwrap_or_default()
-                .to_owned();
-            let old_decoded_len = prev_decoded_len;
-            prev_decoded_len = full_text.len();
-
-            let (final_new_text, hit_stop_seq) = if !stop_sequences.is_empty() {
-                if let Some(truncated) = check_stop_sequences(&full_text, stop_sequences) {
-                    let emit = truncated
-                        .get(old_decoded_len..)
+            let condition = self.check_termination(
+                token_id,
+                completion_len,
+                max_tokens,
+                &generated_text,
+                &stop_window,
+                stop_sequences,
+            );
+            let (final_new_text, next_emitted_len) = match &condition {
+                FinishCondition::StopSequence(truncated) => (
+                    truncated.get(emitted_len..).unwrap_or_default().to_owned(),
+                    truncated.len(),
+                ),
+                _ => (
+                    generated_text
+                        .get(emitted_len..)
                         .unwrap_or_default()
-                        .to_owned();
-                    (emit, true)
-                } else {
-                    (new_text, false)
-                }
-            } else {
-                (new_text, false)
+                        .to_owned(),
+                    generated_text.len(),
+                ),
             };
+            emitted_len = next_emitted_len;
 
-            let is_eos = self.eos_token_ids.contains(&token_id);
-            let is_max = completion_len >= max_tokens;
-            let step_finished = is_eos || is_max || hit_stop_seq;
-
-            let finish_reason = if is_eos || hit_stop_seq {
-                Some("stop".to_owned())
-            } else if is_max {
-                Some("length".to_owned())
-            } else {
-                None
-            };
+            let step_finished = condition.is_finished();
+            let finish_reason = condition.reason_str().map(str::to_owned);
 
             if sender
                 .blocking_send(StreamingOutput {
@@ -775,6 +846,57 @@ fn sample_token_id(
         ));
     }
 
+    let top_k_limited = matches!(sampling.top_k, Some(value) if value > 0);
+    let requires_host_sampling = (sampling.repetition_penalty - 1.0).abs() > f32::EPSILON
+        || top_k_limited
+        || sampling.top_p < 1.0;
+
+    if !requires_host_sampling {
+        return sample_token_id_device(logits, sampling, rng);
+    }
+
+    sample_token_id_host(logits, sampling, history_tokens, rng)
+}
+
+fn sample_token_id_device(
+    logits: &Array,
+    sampling: SamplingConfig,
+    rng: &mut SamplerRng,
+) -> Result<u32, EngineError> {
+    let float_logits = logits.as_type::<f32>().map_err(EngineError::Mlx)?;
+    if float_logits.shape().contains(&0) {
+        return Err(EngineError::Generation(
+            "logits tensor is unexpectedly empty".to_owned(),
+        ));
+    }
+
+    if sampling.temperature <= 0.0 {
+        let sampled = argmax_axis(&float_logits, -1, Some(false)).map_err(EngineError::Mlx)?;
+        eval([&sampled]).map_err(EngineError::Mlx)?;
+        return Ok(sampled.item());
+    }
+
+    let scaled_logits = float_logits
+        .divide(Array::from(sampling.temperature))
+        .map_err(EngineError::Mlx)?;
+    let sampling_key = key(rng.random_u64()).map_err(EngineError::Mlx)?;
+    let sampled = categorical(
+        &scaled_logits,
+        Some(-1),
+        None::<ShapeOrCount<'_>>,
+        Some(&sampling_key),
+    )
+    .map_err(EngineError::Mlx)?;
+    eval([&sampled]).map_err(EngineError::Mlx)?;
+    Ok(sampled.item())
+}
+
+fn sample_token_id_host(
+    logits: &Array,
+    sampling: SamplingConfig,
+    history_tokens: &[u32],
+    rng: &mut SamplerRng,
+) -> Result<u32, EngineError> {
     let float_logits = logits.as_type::<f32>().map_err(EngineError::Mlx)?;
     let mut scores = float_logits.as_slice::<f32>().to_vec();
     if scores.is_empty() {
@@ -939,6 +1061,48 @@ fn check_stop_sequences(text: &str, stop_sequences: &[String]) -> Option<String>
         }
     }
     earliest.map(|pos| text.get(..pos).unwrap_or_default().to_owned())
+}
+
+fn max_stop_sequence_chars(stop_sequences: &[String]) -> usize {
+    stop_sequences
+        .iter()
+        .map(|seq| seq.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+fn append_stop_window(stop_window: &mut String, token_text: &str, max_chars: usize) {
+    if max_chars == 0 || token_text.is_empty() {
+        return;
+    }
+    stop_window.push_str(token_text);
+    let total_chars = stop_window.chars().count();
+    if total_chars <= max_chars {
+        return;
+    }
+    let trim_chars = total_chars - max_chars;
+    let trim_to = stop_window
+        .char_indices()
+        .nth(trim_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    stop_window.drain(..trim_to);
+}
+
+fn truncate_text_for_stop_window(
+    generated_text: &str,
+    stop_window: &str,
+    stop_sequences: &[String],
+) -> Option<String> {
+    let truncated_window = check_stop_sequences(stop_window, stop_sequences)?;
+    let bytes_to_trim = stop_window.len().saturating_sub(truncated_window.len());
+    let keep_len = generated_text.len().saturating_sub(bytes_to_trim);
+    Some(
+        generated_text
+            .get(..keep_len)
+            .unwrap_or_default()
+            .to_owned(),
+    )
 }
 
 /// Extract EOS token IDs from config.json.

@@ -3,7 +3,7 @@
 
 #![allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use mlx_server::error::ServerError;
@@ -19,6 +19,26 @@ async fn extract_response(error: ServerError) -> (StatusCode, serde_json::Value,
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     (status, body, content_type)
+}
+
+async fn extract_response_with_retry_after(
+    error: ServerError,
+) -> (StatusCode, serde_json::Value, String, Option<String>) {
+    let response = error.into_response();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    (status, body, content_type, retry_after)
 }
 
 /// Asserts that the given error produces a masked 500 response
@@ -80,6 +100,41 @@ async fn engine_template_error_masked() {
     let engine_err =
         mlx_engine::error::EngineError::Template("missing variable 'content'".to_owned());
     assert_masked_500(ServerError::Engine(engine_err), "missing variable").await;
+}
+
+#[tokio::test]
+async fn engine_cache_admission_error_maps_to_503_with_retry_after() {
+    let engine_err = mlx_engine::error::EngineError::Generation(
+        "cache pressure too high: need 10 pages and have 2 free pages".to_owned(),
+    );
+    let (status, body, content_type, retry_after) =
+        extract_response_with_retry_after(ServerError::Engine(engine_err)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(content_type.contains("application/json"));
+    assert_eq!(
+        body["error"]["message"],
+        "Server is overloaded, retry later"
+    );
+    assert_eq!(body["error"]["type"], "server_overloaded");
+    assert_eq!(retry_after.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn engine_cache_admission_respects_configured_retry_after() {
+    let engine_err = mlx_engine::error::EngineError::Generation(
+        "cache request requires 1024 bytes, but cache budget is 256 bytes".to_owned(),
+    );
+    let mapped = ServerError::from_engine_with_retry(engine_err, 9);
+    let (status, body, _, retry_after) = extract_response_with_retry_after(mapped).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body["error"]["message"],
+        "Server is overloaded, retry later"
+    );
+    assert_eq!(body["error"]["type"], "server_overloaded");
+    assert_eq!(retry_after.as_deref(), Some("9"));
 }
 
 #[tokio::test]

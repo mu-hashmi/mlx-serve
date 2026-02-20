@@ -70,6 +70,8 @@ pub fn build_router(
 
     Router::new()
         .route("/health", get(routes::health::health))
+        .route("/debug/memory", get(routes::debug::memory))
+        .route("/debug/cache/clear", post(routes::debug::clear_cache))
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(

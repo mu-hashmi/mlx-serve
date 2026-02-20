@@ -2,3 +2,6 @@
 .DS_Store
 .vscode/
 .idea/
+benchmarks/results/
+benchmarks/__pycache__/
+*.pyc

@@ -59,12 +59,13 @@ async fn completions_non_streaming(
 
     let encoding = engine
         .tokenizer()
-        .encode(req.prompt.as_str(), false)
+        .encode(req.prompt.as_str(), true)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
 
+    let engine_for_generate = std::sync::Arc::clone(&engine);
     let output = tokio::task::spawn_blocking(move || {
-        engine.generate(
+        engine_for_generate.generate(
             &prompt_tokens,
             max_tokens,
             temperature,
@@ -74,7 +75,15 @@ async fn completions_non_streaming(
     })
     .await
     .map_err(|e| ServerError::InternalError(format!("Task join error: {e}")))?
-    .map_err(ServerError::Engine)?;
+    .map_err(|error| {
+        ServerError::from_engine_with_retry(error, state.config.retry_after_seconds)
+    })?;
+
+    if state.config.clear_runtime_cache_after_request {
+        engine.clear_runtime_cache().map_err(|error| {
+            ServerError::from_engine_with_retry(error, state.config.retry_after_seconds)
+        })?;
+    }
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
@@ -112,7 +121,7 @@ fn completions_stream(
 
     let encoding = engine
         .tokenizer()
-        .encode(req.prompt.as_str(), false)
+        .encode(req.prompt.as_str(), true)
         .map_err(|e| ServerError::BadRequest(format!("Tokenization error: {e}")))?;
     let prompt_tokens = encoding.get_ids().to_vec();
 

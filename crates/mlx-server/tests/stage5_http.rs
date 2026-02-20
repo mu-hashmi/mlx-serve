@@ -59,6 +59,7 @@ async fn start_server(
         max_admitted_requests,
         max_queue_size,
         retry_after_seconds: 2,
+        clear_runtime_cache_after_request: false,
     };
 
     let state: SharedState = Arc::new(AppState {

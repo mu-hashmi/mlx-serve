@@ -78,6 +78,10 @@ struct ServeArgs {
     #[arg(long, default_value_t = 1)]
     retry_after_seconds: u64,
 
+    /// Clear MLX runtime cache after each non-streaming generation request.
+    #[arg(long, default_value_t = false)]
+    clear_runtime_cache_after_request: bool,
+
     /// Request timeout in seconds.
     #[arg(long, default_value_t = 300.0)]
     timeout: f64,
@@ -234,6 +238,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         max_admitted_requests: args.max_admitted_requests.max(1),
         max_queue_size: args.max_queue_size,
         retry_after_seconds: args.retry_after_seconds,
+        clear_runtime_cache_after_request: args.clear_runtime_cache_after_request,
     };
 
     let state: SharedState = Arc::new(AppState {

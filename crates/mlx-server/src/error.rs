@@ -41,9 +41,48 @@ pub enum ServerError {
     Overloaded { retry_after_seconds: u64 },
 }
 
+const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
+
+fn is_engine_cache_admission_error(error: &mlx_engine::error::EngineError) -> bool {
+    match error {
+        mlx_engine::error::EngineError::Generation(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("cache request requires")
+                || message.contains("cache pressure")
+                || message.contains("insufficient free pages")
+        }
+        _ => false,
+    }
+}
+
+impl ServerError {
+    /// Convert an engine error while preserving backpressure semantics.
+    pub fn from_engine_with_retry(
+        error: mlx_engine::error::EngineError,
+        retry_after_seconds: u64,
+    ) -> Self {
+        if is_engine_cache_admission_error(&error) {
+            Self::Overloaded {
+                retry_after_seconds,
+            }
+        } else {
+            Self::Engine(error)
+        }
+    }
+}
+
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, error_type, message, retry_after) = match &self {
+            ServerError::Engine(e) if is_engine_cache_admission_error(e) => {
+                tracing::warn!(error = %e, "Engine cache admission overloaded");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_overloaded",
+                    "Server is overloaded, retry later".to_owned(),
+                    Some(DEFAULT_RETRY_AFTER_SECONDS),
+                )
+            }
             ServerError::Engine(e) => {
                 tracing::error!(error = %e, "Engine error");
                 (
@@ -93,16 +132,12 @@ impl IntoResponse for ServerError {
         });
 
         let mut response = (status, body).into_response();
-        if let Some(value) = retry_after {
-            if let Ok(header_value) = HeaderValue::from_str(&value.to_string()) {
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, header_value);
-            } else if let Ok(header_value) = HeaderValue::from_str("1") {
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, header_value);
-            }
+        if let Some(value) = retry_after
+            && let Ok(header_value) = HeaderValue::from_str(&value.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header_value);
         }
         response
     }
@@ -120,6 +155,13 @@ mod tests {
         let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         (status, body)
+    }
+
+    fn retry_after_value(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
     }
 
     /// Asserts that the given error produces a 500 with a masked message
@@ -198,6 +240,42 @@ mod tests {
         let engine_err =
             mlx_engine::error::EngineError::Template("template parse failed".to_owned());
         assert_masked_500(ServerError::Engine(engine_err), "template parse failed").await;
+    }
+
+    #[tokio::test]
+    async fn test_engine_cache_admission_error_maps_to_503_with_retry_after() {
+        let engine_err = mlx_engine::error::EngineError::Generation(
+            "cache pressure too high: need 10 pages and have 2 free pages".to_owned(),
+        );
+        let resp = ServerError::Engine(engine_err).into_response();
+        let retry_after = retry_after_value(&resp);
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["error"]["message"].as_str().unwrap(),
+            "Server is overloaded, retry later"
+        );
+        assert_eq!(body["error"]["type"].as_str().unwrap(), "server_overloaded");
+        assert_eq!(retry_after.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn test_from_engine_with_retry_uses_configured_retry_after_seconds() {
+        let engine_err = mlx_engine::error::EngineError::Generation(
+            "cache request requires 123 bytes, but cache budget is 100 bytes".to_owned(),
+        );
+        let resp = ServerError::from_engine_with_retry(engine_err, 7).into_response();
+        let retry_after = retry_after_value(&resp);
+        let (status, body) = response_status_and_body(resp).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["error"]["message"].as_str().unwrap(),
+            "Server is overloaded, retry later"
+        );
+        assert_eq!(body["error"]["type"].as_str().unwrap(), "server_overloaded");
+        assert_eq!(retry_after.as_deref(), Some("7"));
     }
 
     #[tokio::test]

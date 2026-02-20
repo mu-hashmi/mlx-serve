@@ -9,6 +9,8 @@
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 - `POST /v1/embeddings`
+- `GET /debug/memory`
+- `POST /debug/cache/clear`
 
 ## `POST /v1/chat/completions`
 
@@ -56,3 +58,20 @@ Decode execution is still serialized to one request at a time on Metal.
 
 Cache paging is logical accounting for memory budgets and eviction only; KV tensors
 are still stored in contiguous MLX cache arrays.
+
+## Debug Endpoints
+
+### `GET /debug/memory`
+
+Returns runtime memory counters:
+
+- `active_bytes` (MLX active bytes)
+- `cache_bytes` (logical prefix cache accounting in use)
+- `baseline_bytes` (engine baseline captured at startup)
+- `prefix_cache_stats` (aggregate page/accounting counters)
+- `engines` (per-model memory/cache breakdown)
+
+### `POST /debug/cache/clear`
+
+Clears prefix cache entries and calls MLX cache clear on all loaded engines.
+Response includes `cleared_engines`.

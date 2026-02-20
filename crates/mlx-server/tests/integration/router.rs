@@ -54,6 +54,22 @@ async fn send_request(
         .unwrap()
 }
 
+/// Send a request to the full router built via `build_router`.
+async fn send_full_router_request(
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::http::Response<axum::body::Body> {
+    let app = build_router(test_state(), 30.0, None, 0);
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (key, value) in headers {
+        builder = builder.header(*key, *value);
+    }
+    app.oneshot(builder.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
 /// Extract JSON body from a response.
 async fn response_json(response: axum::http::Response<axum::body::Body>) -> serde_json::Value {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -215,4 +231,26 @@ async fn health_endpoint_works_on_health_only_router() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
     assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn debug_memory_route_is_wired() {
+    let response = send_full_router_request("GET", "/debug/memory", &[]).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert!(body.get("active_bytes").is_some());
+    assert!(body.get("cache_bytes").is_some());
+    assert!(body.get("baseline_bytes").is_some());
+    assert!(body.get("prefix_cache_stats").is_some());
+    assert!(body["engines"].is_array());
+}
+
+#[tokio::test]
+async fn debug_cache_clear_route_is_wired() {
+    let response = send_full_router_request("POST", "/debug/cache/clear", &[]).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["cleared_engines"], 0);
 }
